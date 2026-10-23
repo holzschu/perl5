@@ -3,7 +3,7 @@ set -euo pipefail
 work=$1
 out=$2
 mkdir -p "$out"
-for name in perl perlA perlB; do
+for name in perl perlA perlB perlC; do
   sim="$work/frameworks/iphonesimulator-universal/$name.framework"
   mkdir -p "$sim"
   cp "$work/frameworks/iphonesimulator-arm64/$name.framework/Info.plist" "$sim/Info.plist"
@@ -21,7 +21,7 @@ for name in perl perlA perlB; do
 done
 (
   cd "$out"
-  for name in perl perlA perlB; do
+  for name in perl perlA perlB perlC; do
     printf '%s  %s.xcframework.zip\n' "$(swift package compute-checksum "$name.xcframework.zip")" "$name"
   done >checksums.txt
 )

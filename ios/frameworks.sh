@@ -22,7 +22,7 @@ cd "$src"
 archives=()
 for ext in $static_ext; do archives+=("lib/auto/$ext/${ext##*/}.a"); done
 : <ext.libs
-for name in perl perlA perlB; do
+for name in perl perlA perlB perlC; do
   framework="$work/frameworks/$sdk-$arch/$name.framework"
   mkdir -p "$framework"
   # Match Perl's link rule: ext.libs contains the static extensions' linker flags.
