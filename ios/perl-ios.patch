@@ -1,0 +1,325 @@
+--- a/perl.h
++++ b/perl.h
+@@ -7105,6 +7105,12 @@
+ */
+ 
+ START_EXTERN_C
++
++#ifdef PERL_IOS
++/* mortal_getenv() must read ios_system's per-command environment. */
++extern char *ios_getenv(const char *name);
++#  define getenv ios_getenv
++#endif
+ 
+ #  include "inline.h"
+ 
+@@ -8396,6 +8402,10 @@
+ 
+ #endif /* Include guard */
+ 
++#if defined(PERL_IOS) && !defined(PERL_NO_INLINE_FUNCTIONS)
++#  include "ios_port.h"
++#endif
++
+ /*
+  * ex: set ts=8 sts=4 sw=4 et:
+  */
+--- a/perl.c
++++ b/perl.c
+@@ -4575,9 +4575,16 @@
+ 	   if the environment has been modified since. To avoid this
+ 	   problem we treat env==NULL as meaning 'use the default'
+ 	*/
++#ifdef PERL_IOS
++        /* ios_system owns a separate environment for each command. */
++        if (!env)
++            env = environmentVariables(ios_currentPid());
++        env_is_not_environ = FALSE;
++#else
+ 	if (!env)
+ 	    env = environ;
+ 	env_is_not_environ = env != environ;
++#endif
+ 	if (env_is_not_environ
+ #  ifdef USE_ITHREADS
+ 	    && PL_curinterp == aTHX
+--- a/perlio.c
++++ b/perlio.c
+@@ -1115,14 +1115,64 @@
+ #define PerlIO_default_top() PerlIO_default_layer(aTHX_ -1)
+ #define PerlIO_default_btm() PerlIO_default_layer(aTHX_ 0)
+ 
++#ifdef PERL_IOS
++/* ios_system admits one command per library and unloads it after return. */
++static int ios_perl_stdio[3] = {-1, -1, -1};
++
++PerlIO *
++ios_perl_popen(const char *cmd, const char *mode)
++{
++    FILE *stream = ios_popen(cmd, mode);
++    PerlIO *f;
++    if (!stream)
++        return NULL;
++    f = PerlIO_importFILE(stream, mode);
++    if (!f) {
++        int saved_errno = errno;
++        fclose(stream);
++        errno = saved_errno;
++    }
++    return f;
++}
++
++int
++ios_perl_isatty(int fd)
++{
++    if (fd >= 0) {
++        if (fd == ios_perl_stdio[0])
++            return ios_isatty(fileno(thread_stdin));
++        if (fd == ios_perl_stdio[1])
++            return ios_isatty(fileno(thread_stdout));
++        if (fd == ios_perl_stdio[2])
++            return ios_isatty(fileno(thread_stderr));
++    }
++    return ios_isatty(fd);
++}
++#endif
++
+ void
+ PerlIO_stdstreams(pTHX)
+ {
+     if (!PL_perlio) {
++#ifdef PERL_IOS
++        PerlIO *err;
++#endif
+         PerlIO_init_table(aTHX);
++#ifdef PERL_IOS
++        /* Perl owns these duplicates, not the host's command streams. */
++        ios_perl_stdio[0] = dup(fileno(thread_stdin));
++        ios_perl_stdio[1] = dup(fileno(thread_stdout));
++        ios_perl_stdio[2] = dup(fileno(thread_stderr));
++        PerlIO_fdopen(ios_perl_stdio[0], "Ir" PERLIO_STDTEXT);
++        PerlIO_fdopen(ios_perl_stdio[1], "Iw" PERLIO_STDTEXT);
++        err = PerlIO_fdopen(ios_perl_stdio[2], "Iw" PERLIO_STDTEXT);
++        if (err)
++            PerlIOBase(err)->flags |= PERLIO_F_UNBUF;
++#else
+         PerlIO_fdopen(0, "Ir" PERLIO_STDTEXT);
+         PerlIO_fdopen(1, "Iw" PERLIO_STDTEXT);
+         PerlIO_fdopen(2, "Iw" PERLIO_STDTEXT);
++#endif
+     }
+ }
+ 
+@@ -2814,6 +2864,14 @@
+         SETERRNO(EBADF,SS_IVCHAN);
+         return -1;
+     }
++#ifdef PERL_IOS
++    {
++        int i;
++        for (i = 0; i < 3; ++i)
++            if (ios_perl_stdio[i] == fd)
++                ios_perl_stdio[i] = -1;
++    }
++#endif
+     while (PerlLIO_close(fd) != 0) {
+         if (errno != EINTR) {
+             code = -1;
+--- a/ext/ExtUtils-Miniperl/lib/ExtUtils/Miniperl.pm
++++ b/ext/ExtUtils-Miniperl/lib/ExtUtils/Miniperl.pm
+@@ -136,7 +136,7 @@
+ 	if (!my_perl)
+ 	    exit(1);
+ 	perl_construct(my_perl);
+-	PL_perl_destruct_level = 0;
++	PL_perl_destruct_level = 2;
+     }
+     PL_exit_flags |= PERL_EXIT_DESTRUCT_END;
+     if (!perl_parse(my_perl, xs_init, argc, argv, (char **)NULL))
+@@ -170,7 +170,7 @@
+ 
+     PERL_SYS_TERM();
+ 
+-    exit(exitstatus);
++    return exitstatus;
+ }
+ 
+ /* Register any extra external extensions */
+--- a/pp_sys.c
++++ b/pp_sys.c
+@@ -4303,7 +4303,7 @@
+     I32 value;
+ # ifdef __amigaos4__
+     void * result;
+-# else
++# elif !defined(PERL_IOS)
+     int result;
+ # endif
+ 
+@@ -4349,7 +4349,50 @@
+         TAINT_PROPER("system");
+     }
+     PERL_FLUSHALL_FOR_CHILD;
+-#if (defined(HAS_FORK) || defined(__amigaos4__)) && !defined(VMS) && !defined(OS2) || defined(PERL_MICRO)
++#ifdef PERL_IOS
++    {
++        pid_t childpid;
++        SV *really = NULL;
++        if (PL_op->op_flags & OPf_STACKED) {
++            really = *++MARK;
++        }
++        if (SP == MARK && !really) {
++            SETERRNO(ENOENT, RMS_FNF);
++            value = -1;
++        } else if ((childpid = ios_fork()) < 0) {
++            value = -1;
++        } else {
++            if (SP - MARK == 1 && !really) {
++                value = ios_system(SvPV_nolen(*SP));
++            } else {
++                char **argv, **arg;
++                ENTER;
++                Newx(argv, SP - MARK + 2, char *);
++                SAVEFREEPV(argv);
++                arg = argv;
++                if (really) {
++                    *arg = savepv(SvPV_nolen(really));
++                    SAVEFREEPV(*arg++);
++                    if (MARK < SP)
++                        ++MARK; /* ios_execv uses the program name as argv[0]. */
++                }
++                while (++MARK <= SP) {
++                    *arg = savepv(SvPV_nolen(*MARK));
++                    SAVEFREEPV(*arg++);
++                }
++                *arg = NULL;
++                /* List-form system must bypass shell parsing and PATH defaults. */
++                value = ios_execv(argv[0], argv);
++                LEAVE;
++            }
++            ios_waitpid(childpid);
++            value = ios_getCommandStatus() & 0xFF;
++        }
++    }
++    STATUS_NATIVE_CHILD_SET(value < 0 ? -1 : value << 8);
++    SP = ORIGMARK;
++    XPUSHi(STATUS_CURRENT);
++#elif (defined(HAS_FORK) || defined(__amigaos4__)) && !defined(VMS) && !defined(OS2) || defined(PERL_MICRO)
+     {
+ #ifdef __amigaos4__
+         struct UserData userdata;
+--- a/util.c
++++ b/util.c
+@@ -2649,7 +2649,13 @@
+ PerlIO *
+ Perl_my_popen_list(pTHX_ const char *mode, int n, SV **args)
+ {
+-#if (!defined(DOSISH) || defined(HAS_FORK)) && !defined(OS2) && !defined(VMS) && !defined(NETWARE) && !defined(__LIBCATAMOUNT__) && !defined(__amigaos4__)
++#ifdef PERL_IOS
++    SV *command = sv_2mortal(newSVpvs(""));
++    int i;
++    for (i = 0; i < n; ++i)
++        ios_perl_quote(aTHX_ command, SvPV_nolen(args[i]));
++    return Perl_my_popen(aTHX_ SvPV_nolen(command), mode);
++#elif (!defined(DOSISH) || defined(HAS_FORK)) && !defined(OS2) && !defined(VMS) && !defined(NETWARE) && !defined(__LIBCATAMOUNT__) && !defined(__amigaos4__)
+     int p[2];
+     I32 This, that;
+     Pid_t pid;
+@@ -2786,6 +2792,33 @@
+ PerlIO *
+ Perl_my_popen(pTHX_ const char *cmd, const char *mode)
+ {
++#ifdef PERL_IOS
++    PerlIO *f;
++    SV *sv;
++    pid_t pid;
++    int probe[2];
++    PERL_FLUSHALL_FOR_CHILD;
++    /* Reject descriptor exhaustion before ios_fork takes its pid mutex. */
++    if (PerlProc_pipe(probe) < 0)
++        return NULL;
++    PerlLIO_close(probe[0]);
++    PerlLIO_close(probe[1]);
++    pid = ios_fork();
++    if (pid < 0)
++        return NULL;
++    f = ios_perl_popen(cmd, mode);
++    if (!f) {
++        int saved_errno = errno;
++        ios_waitpid(pid);
++        errno = saved_errno;
++        return NULL;
++    }
++    sv = *av_fetch(PL_fdpid, PerlIO_fileno(f), TRUE);
++    SvUPGRADE(sv, SVt_IV);
++    SvIV_set(sv, pid);
++    PL_forkprocess = pid;
++    return f;
++#else
+     int p[2];
+     I32 This, that;
+     Pid_t pid;
+@@ -2922,6 +2955,7 @@
+     if (did_pipes)
+          PerlLIO_close(pp[0]);
+     return PerlIO_fdopen(p[This], mode);
++#endif /* PERL_IOS */
+ }
+ #elif defined(DJGPP)
+ FILE *djgpp_popen();
+@@ -3244,9 +3278,17 @@
+ #endif
+     close_failed = (PerlIO_close(ptr) == EOF);
+     SAVE_ERRNO;
+-    if (should_wait) do {
++    if (should_wait) {
++#ifdef PERL_IOS
++        ios_waitpid(pid);
++        status = (ios_getCommandStatus() & 0xFF) << 8;
++        pid2 = pid;
++#else
++      do {
+         pid2 = wait4pid(pid, &status, 0);
+-    } while (pid2 == -1 && errno == EINTR);
++      } while (pid2 == -1 && errno == EINTR);
++#endif
++    }
+     if (close_failed) {
+         RESTORE_ERRNO;
+         return -1;
+@@ -5459,15 +5501,20 @@
+ #        elif defined(HAS_UNSETENV)
+     int bsiz = 80; /* Most envvar names will be shorter than this. */
+     char *buf = (char*)safesysmalloc(bsiz);
+-    while (*environ != NULL) {
+-      char *e = strchr(*environ, '=');
+-      int l = e ? e - *environ : (int)strlen(*environ);
++    char **env;
++#          ifdef PERL_IOS
++    while ((env = environmentVariables(ios_currentPid())) && *env != NULL) {
++#          else
++    while ((env = environ) && *env != NULL) {
++#          endif
++      char *e = strchr(*env, '=');
++      int l = e ? e - *env : (int)strlen(*env);
+       if (bsiz < l + 1) {
+         (void)safesysfree(buf);
+         bsiz = l + 1; /* + 1 for the \0. */
+         buf = (char*)safesysmalloc(bsiz);
+       } 
+-      memcpy(buf, *environ, l);
++      memcpy(buf, *env, l);
+       buf[l] = '\0';
+       (void)unsetenv(buf);
+     }
+--- a/Makefile.SH
++++ b/Makefile.SH
+@@ -975,7 +975,7 @@
+ 
+ !NO!SUBS!
+ 
+-	case "${osname}${osvers}" in
++	case "${hostperl:+cross}${osname}${osvers}" in
+ 	amigaos*)
+ 		$spitshell >>$Makefile <<'!NO!SUBS!'
+ lib/buildcustomize.pl: $& $(miniperl_objs) write_buildcustomize.pl
